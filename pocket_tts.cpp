@@ -2502,16 +2502,20 @@ private:
             std::string format = json_get_string(req.body, "response_format");
             if (format.empty()) format = "wav";
             
-            if (text.empty() || voice.empty()) {
+                        if (text.empty() || voice.empty()) {
                 send_response(client_fd, 400, "application/json", 
                     "{\"error\":{\"message\":\"Missing 'input' or 'voice'\",\"type\":\"invalid_request_error\"}}");
                 return;
             }
             
+            // Hermes requests mp3/opus/flac depending on the platform output path, but this
+            // server only encodes WAV/PCM. Serve WAV bytes for any audio format instead of
+            // rejecting: consumers sniff or transcode the container (Hermes repairs .ogg
+            // paths via ffmpeg; Discord plays via ffmpeg). Unknown formats also fall through
+            // to WAV for maximum OpenAI-compat. ponytail: wav bytes under a foreign name —
+            // add real mp3/opus encoding only if a consumer requires byte-honest containers.
             if (format != "wav" && format != "pcm") {
-                send_response(client_fd, 400, "application/json",
-                    "{\"error\":{\"message\":\"Unsupported response_format. Use 'wav' or 'pcm'.\",\"type\":\"invalid_request_error\"}}");
-                return;
+                format = "wav";
             }
             
             auto start = std::chrono::high_resolution_clock::now();
