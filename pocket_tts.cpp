@@ -2236,6 +2236,20 @@ static std::string json_get_string(const std::string& json, const std::string& k
     return result;
 }
 
+// OpenAI audio output only: saturate to signed16, round ties away from zero,
+// and replace nonfinite samples with silence. Internal audio remains float.
+static void encode_pcm16_le(const float* samples, size_t count, uint8_t* out) {
+    for (size_t i = 0; i < count; ++i) {
+        float sample = std::isfinite(samples[i]) ? samples[i] : 0.0f;
+        sample = std::clamp(sample, -1.0f, 1.0f);
+        long value = std::lround(static_cast<double>(sample) * 32768.0);
+        value = std::clamp(value, -32768L, 32767L);
+        uint16_t bits = static_cast<uint16_t>(value);
+        out[2 * i] = static_cast<uint8_t>(bits & 0xff);
+        out[2 * i + 1] = static_cast<uint8_t>(bits >> 8);
+    }
+}
+
 class TTSServer {
     PocketTTS& tts_;
     int port_;
@@ -2372,30 +2386,37 @@ private:
         ptt_send(fd, data, len);
     }
     
-    // Encode float PCM samples as a WAV file in memory
+    // Encode OpenAI mono PCM16 WAV; CLI/FFI float output uses separate paths.
     static std::vector<uint8_t> wav_encode(const float* samples, size_t count, int sample_rate) {
-        uint32_t data_size = count * sizeof(float);
+        if (count > (std::numeric_limits<uint32_t>::max() - 36) / 2)
+            throw std::runtime_error("Audio too large for PCM16 WAV");
+        uint32_t data_size = static_cast<uint32_t>(count * 2);
         uint32_t file_size = 36 + data_size;
         
-        std::vector<uint8_t> buf(44 + data_size);
+        std::vector<uint8_t> buf(44 + static_cast<size_t>(data_size));
         auto w = [&](size_t off, const void* src, size_t n) { memcpy(buf.data() + off, src, n); };
-        auto w32 = [&](size_t off, uint32_t v) { memcpy(buf.data() + off, &v, 4); };
-        auto w16 = [&](size_t off, uint16_t v) { memcpy(buf.data() + off, &v, 2); };
+        auto w32 = [&](size_t off, uint32_t v) {
+            for (size_t i = 0; i < 4; ++i) buf[off + i] = static_cast<uint8_t>(v >> (8 * i));
+        };
+        auto w16 = [&](size_t off, uint16_t v) {
+            buf[off] = static_cast<uint8_t>(v & 0xff);
+            buf[off + 1] = static_cast<uint8_t>(v >> 8);
+        };
         
         w(0, "RIFF", 4);
         w32(4, file_size);
         w(8, "WAVE", 4);
         w(12, "fmt ", 4);
         w32(16, 16);                            // fmt chunk size
-        w16(20, 3);                             // IEEE float
+        w16(20, 1);                             // signed integer PCM
         w16(22, 1);                             // mono
         w32(24, sample_rate);
-        w32(28, sample_rate * sizeof(float));   // byte rate
-        w16(32, sizeof(float));                 // block align
-        w16(34, 32);                            // bits per sample
+        w32(28, sample_rate * 2);                // byte rate
+        w16(32, 2);                             // block align
+        w16(34, 16);                            // bits per sample
         w(36, "data", 4);
         w32(40, data_size);
-        memcpy(buf.data() + 44, samples, data_size);
+        encode_pcm16_le(samples, count, buf.data() + 44);
         
         return buf;
     }
@@ -2534,8 +2555,9 @@ private:
                 std::cout << "  Done: " << std::fixed << std::setprecision(2) << duration << "s audio in " << elapsed << "s (RTFx: " << duration/elapsed << "x)\n";
                 
                 if (format == "pcm") {
-                    send_binary_response(client_fd, "audio/pcm",
-                        audio.samples.data(), audio.samples.size() * sizeof(float));
+                    std::vector<uint8_t> pcm(audio.samples.size() * 2);
+                    encode_pcm16_le(audio.samples.data(), audio.samples.size(), pcm.data());
+                    send_binary_response(client_fd, "audio/pcm", pcm);
                 } else {
                     auto wav = wav_encode(audio.samples.data(), audio.samples.size(), PocketTTS::SR);
                     send_binary_response(client_fd, "audio/wav", wav);
